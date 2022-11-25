@@ -1,0 +1,240 @@
+import numpy as np
+import pandas as pd 
+import matplotlib.pyplot as plt
+
+import random
+import shutil 
+import torch
+import torchvision
+from torchvision import transforms, models
+import os
+import copy
+from tqdm import tqdm
+import zipfile
+random.seed(9)
+np.random.seed(9)
+torch.manual_seed(9)
+
+# setup of functions
+
+def import_from_zip(zip_way, data_way):
+    with zipfile.ZipFile(zip_way) as zip_obj:
+        zip_obj.extractall(data_way)
+    
+    print('After zip extraction:')
+    print(os.listdir("/data/"))
+
+def create_dataset(train_dir, val_dir, class_name):
+    for dir_name in [train_dir, val_dir]:
+        for class_name in class_names:
+            os.makedirs(os.path.join(dir_name, class_name), exist_ok=True)
+
+    for class_name in class_names:
+        source_dir = os.path.join(data_root, 'train', class_name)
+        for i, file_name in enumerate(tqdm(os.listdir(source_dir))):
+            if i % 5 != 0:
+                dest_dir = os.path.join(train_dir, class_name) 
+            else:
+                dest_dir = os.path.join(val_dir, class_name)
+            shutil.copy(os.path.join(source_dir, file_name), os.path.join(dest_dir, file_name))
+            
+def show_input(input_tensor, title=''):
+    image = input_tensor.permute(1, 2, 0).numpy()
+    image = std * image + mean
+    plt.imshow(image.clip(0, 1))
+    plt.title(title)
+    plt.show()
+    plt.pause(0.001)
+    
+class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
+        path = self.imgs[index][0]
+        tuple_with_path = (original_tuple + (path,))
+        return tuple_with_path
+    
+def make_prediction_and_show(test_dir, batch_size):
+    test_dataset = ImageFolderWithPaths(test_dir, val_transforms)
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    model.eval()
+    test_predictions = []
+    test_img_paths = []
+    for inputs, labels, paths in tqdm(test_dataloader):
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+        with torch.set_grad_enabled(False):
+            preds = model(inputs)
+        test_predictions.append(
+            torch.nn.functional.softmax(preds, dim=1)[:,1].data.cpu().numpy())
+        test_img_paths.extend(paths)
+    
+    test_predictions = np.concatenate(test_predictions)
+    inputs, labels, paths = next(iter(test_dataloader))
+
+    for img, pred in zip(inputs, test_predictions):
+        show_input(img, title=pred)
+    return test_predictions, test_img_paths
+
+def make_submission(test_img_paths, test_predictions, file_name):
+    submission_df = pd.DataFrame.from_dict({'id': test_img_paths, 'label': test_predictions})
+
+    submission_df['label'] = submission_df['label'].map(lambda pred: 'dirty' if pred > 0.5 else 'cleaned')
+    submission_df['id'] = submission_df['id'].str.replace('input/data/test', '')
+    submission_df['id'] = submission_df['id'].str.replace('\\', '')
+    submission_df['id'] = submission_df['id'].str.replace('unknown', '')
+    submission_df['id'] = submission_df['id'].str.replace('.jpg', '')
+    submission_df.set_index('id', inplace=True)
+    submission_df.head(n=6)
+    
+    submission_df.to_csv(file_name)
+    
+def train_model(model, loss, optimizer, scheduler, num_epochs):
+    
+    loss_hist_train = []
+    accuracy_hist_train = []
+    loss_hist_val = []
+    accuracy_hist_val = []
+    
+    for epoch in range(num_epochs):
+        print('Epoch {}/{}:'.format(epoch + 1, num_epochs), flush=True)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                dataloader = train_dataloader
+                scheduler.step()
+                model.train() 
+            else:
+                dataloader = val_dataloader
+                model.eval()  
+
+            running_loss = 0.
+            running_acc = 0.
+
+            for inputs, labels in tqdm(dataloader):
+                
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    preds = model(inputs)
+                    loss_value = loss(preds, labels)
+                    preds_class = preds.argmax(dim=1)
+
+                    if phase == 'train':
+                        loss_value.backward()
+                        optimizer.step()
+                        
+                running_loss += loss_value.item()
+                running_acc += (preds_class == labels.data).float().mean()
+    
+             
+            epoch_loss = running_loss / len(dataloader)
+            epoch_acc = running_acc / len(dataloader)
+            
+            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc), flush=True)
+
+            if phase == 'train':
+                loss_hist_train.append(epoch_loss)
+                accuracy_hist_train.append(epoch_acc)
+            else:
+                loss_hist_val.append(epoch_loss)
+                accuracy_hist_val.append(epoch_acc)
+            
+
+    return loss_hist_train, accuracy_hist_train, loss_hist_val, accuracy_hist_val, model
+
+# import dataset
+
+zip_way = 'input/plates.zip'
+data_way = '/input/data/'
+import_from_zip(zip_way, data_way)
+train_dir = 'input/data/train'
+val_dir = 'input/data/val'
+class_names = ['cleaned', 'dirty']
+test_dir = 'input/data/test'
+shutil.copytree(os.path.join(data_root, 'test'), os.path.join(test_dir, 'unknown'))
+create_dataset(train_dir, val_dir, class_name)
+
+# setup of model
+
+model = models.resnet18(pretrained=True)
+
+for param in model.parameters():
+    param.requires_grad = False
+
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+
+loss = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), amsgrad=True, lr=1.0e-3)
+
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1);
+
+# transformation of dataset
+
+def transformation_dataset(train_dir, val_dir, batch_size):
+    train_transforms = transforms.Compose([
+    #transforms.RandomPerspective(distortion_scale=0.1, p=0.5, fill=0),
+    transforms.RandomRotation(360),
+    transforms.CenterCrop(200),
+    transforms.RandomResizedCrop(224, scale=(0.8, 1.0), ratio=(0.75, 1.25)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.ColorJitter(brightness=0, contrast=0.3, saturation=0.5, hue=0),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    val_transforms = transforms.Compose([ 
+    transforms.CenterCrop(200),
+    transforms.Resize((224, 224)), 
+    transforms.ColorJitter(brightness=0, contrast=0.3, saturation=0.5, hue=0),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = torchvision.datasets.ImageFolder(train_dir, train_transforms)
+    val_dataset = torchvision.datasets.ImageFolder(val_dir, val_transforms)
+
+    batch_size = batch_size
+    train_dataloader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True, num_workers=batch_size)
+    val_dataloader = torch.utils.data.DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=False, num_workers=batch_size)
+    
+transformation_dataset(train_dir, val_dir, 8)
+
+# vizualization of batch
+
+X_batch, y_batch = next(iter(train_dataloader))
+
+for x_item, y_item in zip(X_batch, y_batch):
+    show_input(x_item, title=class_names[y_item])
+
+# model training
+
+loss_history_train = []
+accuracy_histoty_train = []
+loss_history_val = []
+accuracy_histoty_val = []
+loss_history_train, accuracy_histoty_train, loss_history_val, accuracy_histoty_val, trained_model = \
+     train_model(model, loss, optimizer, scheduler, num_epochs = 100);
+
+# vizualization of loss and accuracy
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15 ,7))
+
+ax1.plot(loss_history_train, label='train')
+ax1.plot(loss_history_val, label='val')
+ax1.legend(loc='upper right')
+ax1.set_title('Loss')
+
+ax2.plot(accuracy_histoty_train, label='train')
+ax2.plot(accuracy_histoty_val, label='val')
+ax2.legend(loc='upper right')
+ax2.set_title('Accuracy');
+
+# make prediction, vizualization and make sibmission file
+
+make_prediction_and_show(test_dir, 8);
+make_submission(test_img_paths, test_predictions, 'submission.csv');
+
